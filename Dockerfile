@@ -1,9 +1,8 @@
 FROM python:alpine 
 
-
 RUN apk update 
 
-RUN pip install stashapp-tools aiohttp asyncio 
+RUN pip install stashapp-tools aiohttp asyncio python-dotenv
 
 WORKDIR /opt/app
 

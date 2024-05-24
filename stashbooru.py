@@ -1,10 +1,11 @@
+import asyncio
+import base64
+import json
 import time
 
 import aiohttp
-import asyncio
-import json
-import base64
 import stashapi.log as log
+from dotenv import get_key
 from stashapi.stashapp import StashInterface
 
 
@@ -14,7 +15,7 @@ class ServerInfo:
     stash_port_nr = 9999
     deepbooru_port_nr = 7860
     DEEPBOORU_URL = f"http://{deepbooru_domain}:{deepbooru_port_nr}/api/predict"  # replace with your API URL
-    stash_api_key = ""
+    stash_api_key = get_key(dotenv_path=".env", key_to_get="stash_api_key")
     stashargs = {
         "scheme": "http",
         "host": stash_domain,

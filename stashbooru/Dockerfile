@@ -1,12 +1,11 @@
 FROM python:alpine 
 
-
 RUN apk update 
-
-RUN pip install stashapp-tools aiohttp asyncio 
 
 WORKDIR /opt/app
 
 COPY . .
+
+RUN pip install -r requirements.txt
 
 ENTRYPOINT ["python", "stashbooru.py"]

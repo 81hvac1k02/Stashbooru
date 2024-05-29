@@ -1,0 +1,5 @@
+stashapp-tools
+aiohttp
+ffmpeg-python
+requests
+python-dotenv

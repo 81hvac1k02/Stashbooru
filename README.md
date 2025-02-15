@@ -25,5 +25,5 @@ Replace your-deepbooru-domain, your-stash-domain, and your-stash-api-key with yo
 ## Docker 
 Clone the repo and run 
 ```sh
-docker compose up -d
+mkdir files && chmod 777 files && docker compose build && docker compose up -d
 ```

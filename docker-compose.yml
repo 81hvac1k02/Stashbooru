@@ -8,13 +8,19 @@ services:
         platform: linux/amd64
         environment:
             - CACHE_EXAMPLES=1
-        image: registry.hf.space/cc1234-deepdanbooru:latest
+        image: registry.hf.space/hysts-deepdanbooru:latest
         command: [ "python", "app.py" ]
         networks:
             - stash_default
         container_name: deepbooru
         volumes:
             - ./files/:/home/user/.cache/
+        healthcheck:
+            test: [ "CMD", "curl -s -f http://localhost:7860 > /dev/null || exit 1" ]
+            interval: 1m30s
+            timeout: 30s
+            retries: 5
+            start_period: 30s
 
     stashbooru:
         networks:
@@ -26,10 +32,9 @@ services:
             - ./.env:/opt/app/.env
         depends_on:
             cc1234-deepdanbooru:
+                condition: service_healthy
 
-
-    networks:
-        # the name of the network stash is running on 
-        stash_default:
-            external: true
-            name: stash_default
+networks:
+    stash_default:
+        external: true
+        name: stash_default

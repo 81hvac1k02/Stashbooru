@@ -6,25 +6,28 @@ services:
         ports:
             - 7860:7860
         platform: linux/amd64
-        #environment:
-        #   - CACHE_EXAMPLES=1
+        environment:
+            - CACHE_EXAMPLES=1
         image: registry.hf.space/cc1234-deepdanbooru:latest
-        command: ["python", "app.py"]
+        command: [ "python", "app.py" ]
         networks:
             - stash_default
         container_name: deepbooru
-        volumes: 
+        volumes:
             - ./files/:/home/user/.cache/
-            
+
     stashbooru:
-            networks:
-                - stash_default
-            image: stashbooru
-            build: .
-            command: ["python", "stashbooru.py"]
-            depends_on: 
-                cc1234-deepdanbooru:
-    
+        networks:
+            - stash_default
+        image: stashbooru
+        build: .
+        command: [ "python", "stashbooru.py" ]
+        volumes:
+            - ./.env:/opt/app/.env
+        depends_on:
+            cc1234-deepdanbooru:
+
+
     networks:
         stash_default:
             external: true

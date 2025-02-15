@@ -1,37 +1,39 @@
 import asyncio
 import base64
 import json
-import os
-import subprocess
-import tempfile
-from itertools import batched
-from pathlib import Path
-from typing import Iterable, Literal, Optional, Union
+import logging
+from typing import Iterable, Literal, Optional
+import aiohttp
+from dotenv import load_dotenv, dotenv_values
 
-import aiofiles
-import stashapi.log as log
-from aiohttp import ClientSession
-from dotenv import dotenv_values, load_dotenv
 from stashapi.stashapp import StashInterface
+import stashapi.log as log
+
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 class ServerConfig:
-    def __init__(self):
-        if not load_dotenv():
-            raise ValueError("no .env found")
-        self.config = dotenv_values(".env")
-        self.deepbooru_domain = self.config["deepbooru_domain"]
-        self.stash_domain = self.config["stash_domain"]
-        self.stash_api_key = self.config["stash_api_key"]
+    def __init__(self, env_file: str = ".env"):
+        if not load_dotenv(dotenv_path=env_file):
+            raise ValueError(f"File {env_file} not found")
+        self.config = dotenv_values(env_file)
+        try:
+            self.deepbooru_domain = self.config["deepbooru_domain"]
+            self.stash_domain = self.config["stash_domain"]
+            self.stash_api_key = self.config["stash_api_key"]
+        except KeyError as err:
+            raise ValueError(f"Missing required configuration: {err}")
         self.deepbooru_port_nr = 7860
         self.stash_port_nr = 9999
 
     @property
-    def deepbooru_url(self):
+    def deepbooru_url(self) -> str:
         return f"http://{self.deepbooru_domain}:{self.deepbooru_port_nr}/api/predict"
 
     @property
-    def stash_args(self):
+    def stash_args(self) -> dict:
         return {
             "scheme": "http",
             "host": self.stash_domain,
@@ -41,233 +43,200 @@ class ServerConfig:
         }
 
 
-class ServerInfo:
-    _config = ServerConfig()
-    stash = StashInterface(_config.stash_args)
+class DeepBooruClient:
+    def __init__(self, config: ServerConfig, session: aiohttp.ClientSession = None):
+        self.config = config
+        self.session = session or aiohttp.ClientSession()
 
-    deepbooru_url = _config.deepbooru_url
+    async def get_tags(
+        self, encoded_string: str, threshold: float = 0.6
+    ) -> Optional[dict[str, str]]:
+        """
+        Calls the DeepBooru api to predict tags for the given encoded string.
+        Returns the tag string if successful, else None.
+        """
+        data = {"data": [encoded_string, threshold]}
 
-    stash_api_key = _config.stash_args["ApiKey"]
+        try:
+            async with self.session.post(
+                self.config.deepbooru_url,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                data=json.dumps(data),
+            ) as response:
+                response.raise_for_status()
+                response_json = await response.json()
+                if "data" in response_json:
+                    return response_json["data"][1]
+                else:
+                    logger.error(
+                        "Response JSON does not contain 'data' key: %s", response_json
+                    )
+        except aiohttp.ClientError as err:
+            logger.error("HTTP client error during get_tags: %s", err)
+        except Exception as err:
+            logger.error("Unexpected error during get_tags: %s", err)
 
-
-def get_untagged_files(
-    file_type: Literal["image", "scene"], return_amount=5, page_nr=1
-) -> Optional[list[dict[str, str | dict]]]:
-    uri = {"image": "thumbnail", "scene": "preview"}
-    fragment = f"id paths{{{uri[file_type]}}}"
-    if return_amount != -1:
-        query = {
-            "per_page": return_amount,
-            "sort": "created_at",
-            "direction": "ASC",
-            "page": page_nr,
-        }
-    else:
-        query = {"per_page": return_amount}
-    # tag_is_null = {"is_missing": "tags"}
-    tag_is_null = {"tag_count": {"modifier": "LESS_THAN", "value": 4}}
-    stash = ServerInfo.stash
-    if file_type == "image":
-        tag_is_null["path"] = {
-            "value": ".avif",
-            "modifier": "EXCLUDES",
-        }  # avif currently fails to get parsed by deepbooru
-        return stash.find_images(fragment=fragment, image_filter=tag_is_null)
-    elif file_type == "scene":
-        tag_is_null["framerate"] = {"modifier": "GREATER_THAN", "value": 0}
-        return stash.find_scenes(fragment=fragment, scene_filter=tag_is_null)
-    else:
         return None
 
+    async def close(self):
+        await self.session.close()
 
-async def process_video(input_file_path: Union[str, Path]) -> None:
-    if isinstance(input_file_path, str):
-        input_file_path = Path(input_file_path)
 
-    output_pattern = f"{input_file_path.with_suffix('')}_keyframe_%03d.png"
+class StashClient:
+    def __init__(self, config: ServerConfig):
+        self.config = config
+        self.stash = StashInterface(self.config.stash_args)
 
-    # Adjust the command to use VAAPI
+    def get_id_of_untagged_files(
+        self, file_type: Literal["image", "scene"]
+    ) -> Optional[list[dict[str, str]]]:
+        """
+        Returns the id for all files that are untagged in Stash for a given file type.
+        """
+        # uri = {"image": "thumbnail", "scene": "preview"}
+        # fragment = f"id paths{{{uri[file_type]}}}"
+        fragment = "id"
+        tag_is_less = {"tag_count": {"modifier": "LESS_THAN", "value": 4}}
+
+        match file_type:
+            case "image":
+                tag_is_less["path"] = {
+                    "value": ".avif",
+                    "modifier": "EXCLUDES",
+                }  # avif currently fails to get parsed by deepbooru
+                return self.stash.find_images(tag_is_less, fragment=fragment)
+            case "scene":
+                tag_is_less["framerate"] = {
+                    "modifier": "GREATER_THAN",
+                    "value": 0,
+                }  # This filters out audio-only and broken scenes
+                return self.stash.find_scenes(tag_is_less, fragment=fragment)
+            case _:
+                return None
+
+    def file_url(self, file_type: str, stash_id: int):
+        uri = {"image": "thumbnail", "scene": "preview"}
+        return f"{self.config.stash_args['scheme']}://{self.config.stash_domain}:{self.config.stash_port_nr}/{file_type}/{stash_id}/{uri[file_type]}?apikey={self.config.stash_api_key}"
+
+    def update_file(self, file_type: str, tags: Iterable, file_id: str):
+        tag_ids = self.stash.map_tag_ids(tags, create=True)
+        update_data = {"ids": [file_id], "tag_ids": {"mode": "ADD", "ids": tag_ids}}
+
+        match file_type:
+            case "image":
+                self.stash.update_images(update_data)
+            case "scene":
+                self.stash.update_scenes(update_data)
+            case "gallery":
+                self.stash.update_galleries(update_data)
+
+
+# A helper function to split PNG images from a byte stream.
+def split_pngs(stream: bytes) -> list[bytes]:
+    # PNG signature (in bytes)
+    png_sig = b"\x89PNG\r\n\x1a\n"
+    # Find all the start positions of PNG files
+    png_starts = []
+    pos = 0
+    while True:
+        pos = stream.find(png_sig, pos)
+        if pos == -1:
+            break
+        png_starts.append(pos)
+        pos += len(png_sig)
+
+    # Split the stream into individual PNG binaries.
+    png_images = []
+    for i, start in enumerate(png_starts):
+        end = png_starts[i + 1] if i + 1 < len(png_starts) else len(stream)
+        png_images.append(stream[start:end])
+    return png_images
+
+
+async def process_video(url: str) -> list[bytes]:
+    """
+    Runs ffmpeg to extract keyframes from the video at `url` as PNG images.
+    """
     command = [
         "ffmpeg",
         "-loglevel",
         "warning",
-        # "-hwaccel", "vaapi",
-        # "-hwaccel_device", "/dev/dri/renderD128",
         "-i",
-        input_file_path,
+        url,
         "-vf",
         "select=eq(pict_type\\,PICT_TYPE_I)",
         "-fps_mode",
         "vfr",
-        output_pattern,
+        "-f",
+        "image2pipe",  # output multiple images to the pipe
+        "-vcodec",
+        "png",  # encode each frame as PNG images
+        "pipe:1",  # write output to stdout
     ]
 
-    await asyncio.to_thread(subprocess.run, command, check=True)
+    process = await asyncio.create_subprocess_exec(
+        *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        error_msg = stderr.decode().strip()
+        raise RuntimeError(f"ffmpeg error: {error_msg}")
+
+    # Split the stdout into separate PNG image binaries.
+    return split_pngs(stdout)
 
 
-async def collect_image_hashes(search_dir: str, file_id: str) -> Optional[set[str]]:
-    file_hashes = set()
+def base64_encode(png_images: list[bytes]):
+    base64_frames = []
+    for png_bytes in png_images:
+        # Use the base64 module to encode the PNG image.
+        b64_str = base64.b64encode(png_bytes).decode("ascii")
+        base64_frames.append(b64_str)
 
-    for root, _, files in os.walk(search_dir):
-        tasks = []
-        for file in files:
-            if file.endswith(".png") and file.startswith(file_id):
-                path = os.path.join(root, file)
-                tasks.append(encode_image(path))
-        if tasks:
-            file_hashes.update(
-                await asyncio.gather(*tasks)
-            )  # Run all tasks concurrently
-    return file_hashes or None
+    for frame in base64_frames:
+        yield frame
 
 
-async def download_file(session: ClientSession, url: str) -> Optional[bytes]:
+async def get_img_data(url: str, session: aiohttp.ClientSession):
     async with session.get(url) as response:
+        response.raise_for_status()
         if response.status == 200:
-            file_content = await response.read()
-            return file_content
-        else:
-            raise Exception(f"Failed to download file: {response.status}")
-
-
-async def encode_image(image_source: Union[str, bytes]) -> str:
-    if isinstance(image_source, str):
-        filepath = Path(image_source)
-        if not filepath.exists():
-            raise FileNotFoundError(f"File not found: {filepath}")
-
-        # Asynchronously read the image file
-        async with aiofiles.open(filepath, "rb") as f:
-            image_content = await f.read()
-    elif isinstance(image_source, bytes):
-        image_content = image_source
-    else:
-        raise ValueError("image_source must be a file path string or bytes.")
-
-    # Encode the image content to base64
-    image_base64 = base64.b64encode(image_content)
-    image_base64_string = image_base64.decode("utf-8")
-    return image_base64_string
-
-
-async def handle_tags(
-    session: ClientSession, encoded_strings: Iterable[str]
-) -> set[str]:
-    tags = set()
-    for enc_str in encoded_strings:
-        if tag_str := await post_request(enc_str, session):
-            for tag in tag_str.split(","):
-                tags.add(tag.strip())
-    return tags
-
-
-async def post_request(
-    encoded_string: str, session: ClientSession, threshold: float = 0.6
-) -> Optional[str]:
-    """
-    Sends a POST request to the Deepbooru server with the encoded image and threshold.
-
-    Args:
-    encoded_string (str): The base64 encoded string of the image to be sent.
-    threshold (float, optional): The threshold value. Defaults to 0.6.
-
-    Returns:
-    str | None: The response data if successful, otherwise None.
-    """
-
-    try:
-        data = {"data": [encoded_string, threshold]}
-        si = ServerInfo()
-        async with session.post(
-            si.deepbooru_url,
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            data=json.dumps(data),
-        ) as response:
-            response.raise_for_status()  # Raise an exception for bad status codes
-            response_json = await response.json()
-
-            if "data" in response_json:
-                response_data = response_json["data"][2]
-
-                return response_data
-
-    except Exception as err:
-        print(err)
-
-
-def update_file(file_type: str, tags: Iterable, file_id: str):
-    si = ServerInfo()
-    stash = si.stash
-    tag_ids = si.stash.map_tag_ids(tags, create=True)
-    update_data = {"id": [file_id], "tag_ids": {"mode": "ADD", "ids": tag_ids}}
-
-    # update_data = {"id": file_id, "tag_ids": tag_ids}
-    if file_type == "image":
-        stash.update_images(update_data)
-    if file_type == "scene":
-        stash.update_scenes(update_data)
-    if file_type == "gallery":
-        stash.update_galleries(update_data)
-
-
-async def download_and_process_file(
-    session: ClientSession, file_type: str, file: dict, temp_dir, si: StashInterface
-):
-    file_id = file["id"]
-    url = file["paths"].get("thumbnail") or file["paths"].get("preview")
-    if url:
-        url = f"{url.split('?')[0]}?apikey={si.stash_api_key}"
-        file_data = await download_file(session=session, url=url)
-
-        if file_type == "scene":
-            await process_scene(file_data, temp_dir, file_id, session)
-        elif file_type == "image":
-            await process_image(file_data, file_id, session)
-
-
-async def process_scene(
-    file_data: bytes, temp_dir: str, file_id: Union[str | int], session: ClientSession
-):
-    file_name = Path(f"{temp_dir}/{file_id}.mp4")
-    async with aiofiles.open(file_name, "wb") as f:
-        await f.write(file_data)
-    await process_video(file_name)
-    if img_hashes := await collect_image_hashes(temp_dir, str(file_id)):
-        if tags := await handle_tags(session, img_hashes):
-            update_file("scene", tags, str(file_id))
-
-
-async def process_image(
-    file_data: bytes, file_id: Union[str | int], session: ClientSession
-):
-    if encoded_strings := await encode_image(file_data):
-        if tags := await handle_tags(session, (encoded_strings,)):
-            update_file("image", tags, str(file_id))
+            return [await response.read()]
 
 
 async def main():
+    config = ServerConfig()
+    session = aiohttp.ClientSession()
+    deepbooru = DeepBooruClient(config=config, session=session)
+    stash = StashClient(config=config)
+
     file_types = ("image", "scene")
-
-    si = ServerInfo()
-    return_amount = 1000
-    batch_amount = 100
     for file_type in file_types:
-        files = get_untagged_files(file_type, return_amount=return_amount)
-        for file_batch in batched(files, batch_amount):
-            with tempfile.TemporaryDirectory() as temp_dir:
-                async with ClientSession() as session:
-                    tasks = []  # Initialize an empty list for tasks
+        logger.info(file_type)
+        if data_list := stash.get_id_of_untagged_files(file_type):
+            # if data_list := static_files(file_type):
+            for data in data_list:
+                stash_id = data["id"]
+                url = stash.file_url(file_type, stash_id)
 
-                    # Create tasks without awaiting them
-                    tasks.extend(
-                        download_and_process_file(
-                            session, file_type, file, temp_dir, si
-                        )
-                        for file in file_batch
-                    )
-                    # Now await the gathered tasks
-                    await asyncio.gather(*tasks)
+                match file_type:
+                    case "image":
+                        file_bytes = await get_img_data(url, session)
+                    case "scene":
+                        file_bytes = await process_video(url)
+                for enc_str in base64_encode(file_bytes):
+                    tag_set = set()
+                    if tags := await deepbooru.get_tags(encoded_string=enc_str):
+                        for tag in tags.keys():
+                            tag_set.add(tag)
+                if tag_set:
+                    stash.update_file(file_type, tag_set, stash_id)
+
+    await session.close()
 
 
+# Example usage: run the process_video function and print list of base64 strings
 if __name__ == "__main__":
     asyncio.run(main())

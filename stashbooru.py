@@ -66,6 +66,7 @@ class DeepBooruClient:
                 response.raise_for_status()
                 response_json = await response.json()
                 if "data" in response_json:
+                    logger.debug(f"returned data is:\n{response_json}")
                     return response_json["data"][1]
                 else:
                     logger.error(
@@ -93,8 +94,7 @@ class StashClient:
         """
         Returns the id for all files that are untagged in Stash for a given file type.
         """
-        # uri = {"image": "thumbnail", "scene": "preview"}
-        # fragment = f"id paths{{{uri[file_type]}}}"
+
         fragment = "id"
         tag_is_less = {"tag_count": {"modifier": "LESS_THAN", "value": 4}}
 
@@ -121,7 +121,7 @@ class StashClient:
     def update_file(self, file_type: str, tags: Iterable, file_id: str):
         tag_ids = self.stash.map_tag_ids(tags, create=True)
         update_data = {"ids": [file_id], "tag_ids": {"mode": "ADD", "ids": tag_ids}}
-
+        logger.debug(f"updating {file_type} with id {file_id} with tags: {tags}")
         match file_type:
             case "image":
                 self.stash.update_images(update_data)
@@ -188,7 +188,7 @@ async def process_video(url: str) -> list[bytes]:
     return split_pngs(stdout)
 
 
-def base64_encode(png_images: list[bytes]):
+async def base64_encode(png_images: list[bytes]):
     base64_frames = []
     for png_bytes in png_images:
         # Use the base64 module to encode the PNG image.
@@ -208,33 +208,29 @@ async def get_img_data(url: str, session: aiohttp.ClientSession):
 
 async def main():
     config = ServerConfig()
-    session = aiohttp.ClientSession()
-    deepbooru = DeepBooruClient(config=config, session=session)
-    stash = StashClient(config=config)
+    async with aiohttp.ClientSession() as session:
+        deepbooru = DeepBooruClient(config=config, session=session)
+        stash = StashClient(config=config)
 
-    file_types = ("image", "scene")
-    for file_type in file_types:
-        logger.info(file_type)
-        if data_list := stash.get_id_of_untagged_files(file_type):
-            # if data_list := static_files(file_type):
-            for data in data_list:
-                stash_id = data["id"]
-                url = stash.file_url(file_type, stash_id)
+        file_types = ("image", "scene")
+        for file_type in file_types:
+            if data_list := stash.get_id_of_untagged_files(file_type):
+                for data in data_list:
+                    stash_id = data["id"]
+                    url = stash.file_url(file_type, stash_id)
 
-                match file_type:
-                    case "image":
-                        file_bytes = await get_img_data(url, session)
-                    case "scene":
-                        file_bytes = await process_video(url)
-                for enc_str in base64_encode(file_bytes):
-                    tag_set = set()
-                    if tags := await deepbooru.get_tags(encoded_string=enc_str):
-                        for tag in tags.keys():
-                            tag_set.add(tag)
-                if tag_set:
-                    stash.update_file(file_type, tag_set, stash_id)
-
-    await session.close()
+                    match file_type:
+                        case "image":
+                            file_bytes = await get_img_data(url, session)
+                        case "scene":
+                            file_bytes = await process_video(url)
+                    async for enc_str in base64_encode(file_bytes):
+                        tag_set = set()
+                        if tags := await deepbooru.get_tags(encoded_string=enc_str):
+                            for tag in tags.keys():
+                                tag_set.add(tag)
+                    if tag_set:
+                        stash.update_file(file_type, tag_set, stash_id)
 
 
 # Example usage: run the process_video function and print list of base64 strings

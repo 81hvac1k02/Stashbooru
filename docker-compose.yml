@@ -29,6 +29,7 @@ services:
 
 
     networks:
+        # the name of the network stash is running on 
         stash_default:
             external: true
             name: stash_default

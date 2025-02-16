@@ -16,7 +16,7 @@ services:
         volumes:
             - ./files/:/home/user/.cache/
         healthcheck:
-            test: [ "CMD", "curl -s -f http://localhost:7860 > /dev/null || exit 1" ]
+            test: [ "curl -f http://localhost:7860 || exit 1" ]
             interval: 1m30s
             timeout: 30s
             retries: 5

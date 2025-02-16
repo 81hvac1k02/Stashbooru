@@ -201,7 +201,6 @@ async def base64_encode(png_images: list[bytes]):
 
 async def get_img_data(url: str, session: aiohttp.ClientSession):
     async with session.get(url) as response:
-        response.raise_for_status()
         if response.status == 200:
             return [await response.read()]
 

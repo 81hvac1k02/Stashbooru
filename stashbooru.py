@@ -96,21 +96,22 @@ class StashClient:
         """
 
         fragment = "id"
-        tag_is_less = {"tag_count": {"modifier": "LESS_THAN", "value": 4}}
+        #tag_is_less = {"tag_count": {"modifier": "LESS_THAN", "value": 4}}
+        tag_is_missing = {"is_missing": "tags"}
 
         match file_type:
             case "image":
-                tag_is_less["path"] = {
+                tag_is_missing["path"] = {
                     "value": ".avif",
                     "modifier": "EXCLUDES",
                 }  # avif currently fails to get parsed by deepbooru
-                return self.stash.find_images(tag_is_less, fragment=fragment)
+                return self.stash.find_images(tag_is_missing, fragment=fragment)
             case "scene":
-                tag_is_less["framerate"] = {
+                tag_is_missing["framerate"] = {
                     "modifier": "GREATER_THAN",
                     "value": 0,
                 }  # This filters out audio-only and broken scenes
-                return self.stash.find_scenes(tag_is_less, fragment=fragment)
+                return self.stash.find_scenes(tag_is_missing, fragment=fragment)
             case _:
                 return None
 
